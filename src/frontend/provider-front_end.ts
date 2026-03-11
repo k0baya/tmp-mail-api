@@ -1470,10 +1470,11 @@ function renderSettingsPage(rawModel: Record<string, unknown>): string {
           <form method="post" action="/admin/settings/provider/${encodeURIComponent(provider.name)}/default" class="inline-form"><button type="submit" class="ghost-btn" ${disableSetDefault ? "disabled" : ""} data-i18n="settings.setDefault">Set default</button></form>
           <form method="post" action="/admin/settings/provider/${encodeURIComponent(provider.name)}/${toggleAction}" class="inline-form"><button type="submit" class="${provider.disabled ? "ghost-btn" : "warn-btn"}" ${provider.disableLocked ? "disabled" : ""} data-i18n="${toggleLabel}">${translateServer(toggleLabel)}</button></form>
           <button type="button" class="ghost-btn" data-test-provider="${escapeHtml(provider.name)}">${icon("zap")}<span data-i18n="settings.testConnection">Test connection</span></button>
+          ${canEdit ? `<button type="button" class="primary-btn" data-open-provider-edit data-provider-name="${escapeHtml(provider.name)}" data-provider-url="${escapeHtml(provider.url)}">${icon("edit")}<span data-i18n="common.edit">Edit</span></button>` : ""}
           ${canDelete ? `<form method="post" action="/admin/settings/provider/${encodeURIComponent(provider.name)}/delete" class="inline-form"><button type="submit" class="danger-btn" ${disableDelete ? "disabled" : ""}>${icon("trash")}<span data-i18n="common.delete">Delete</span></button></form>` : ""}
         </div>
         <div class="provider-secondary">
-          ${canEdit ? `<form method="post" action="/admin/settings/provider" class="provider-edit-form"><input type="hidden" name="name" value="${escapeHtml(provider.name)}" /><label class="field compact-field"><span class="field-label" data-i18n="settings.providerUrl">Provider URL</span><input type="url" name="url" value="${escapeHtml(provider.url)}" required /></label><button type="submit" class="primary-btn">${icon("edit")}<span data-i18n="common.save">Save</span></button></form>` : `<p class="provider-readonly">${icon("lock", "inline-icon")}<span data-i18n="settings.readOnlyMeta">This value is inherited and cannot be edited here.</span></p>`}
+          ${canEdit ? "" : `<p class="provider-readonly">${icon("lock", "inline-icon")}<span data-i18n="settings.readOnlyMeta">This value is inherited and cannot be edited here.</span></p>`}
           <p class="provider-test-note" data-test-status="${escapeHtml(provider.name)}" data-i18n="settings.testIdle">No test run yet.</p>
         </div>
       </div>
@@ -1491,7 +1492,8 @@ function renderSettingsPage(rawModel: Record<string, unknown>): string {
     bodyHtml: `<section class="surface-block"><div class="section-head"><div><h2 data-i18n="settings.providerTitle">Provider routing</h2><p class="section-copy" data-i18n="settings.providerSubtitle">Each provider row is a route policy plus an operational control surface.</p></div><button type="button" class="primary-btn" data-open-provider-create>${icon("plus")}<span data-i18n="settings.createProvider">Add provider</span></button></div><div class="provider-stack">${providerRows || `<p class="muted" data-i18n="settings.noProviders">No providers configured.</p>`}</div></section>
       <section class="surface-block"><div class="section-head"><div><h2 data-i18n="settings.securityTitle">Shared secret</h2><p class="section-copy" data-i18n="settings.securitySubtitle">This token must match every mail provider deployment.</p></div></div><div class="secret-panel"><form method="post" action="/admin/settings/secret" class="secret-form"><input type="hidden" name="intent" value="save" /><label class="field secret-field"><span class="field-label" data-i18n="settings.providerSecret">Provider secret</span><input id="provider-secret-input" type="password" name="value" value="${escapeHtml(model.providerSecret.value)}" placeholder="${escapeHtml(translateServer("settings.providerSecret"))}" ${model.providerSecret.locked ? "readonly" : ""} /><span class="field-hint" data-i18n="settings.secretHint">${escapeHtml(translateServer("settings.secretHint"))}</span></label><button type="button" class="ghost-btn" data-secret-toggle="provider-secret-input">${icon("eye")}<span data-i18n="settings.reveal">Reveal</span></button><button type="submit" class="primary-btn" ${model.providerSecret.locked ? "disabled" : ""}>${icon("save")}<span data-i18n="settings.saveSecret">Save secret</span></button>${model.providerSecret.source === "kv" ? `<button type="submit" class="danger-btn" name="intent" value="delete">${icon("trash")}<span data-i18n="common.delete">Delete</span></button>` : ""}</form></div></section>
       <section class="surface-block"><div class="section-head"><div><h2 data-i18n="settings.advancedTitle">Runtime values</h2><p class="section-copy" data-i18n="settings.advancedSubtitle">Keep these settings boring, predictable, and auditable.</p></div></div><div class="runtime-stack">${renderRuntimeRow(model.mailIdTtl, "86400000", "settings.mailIdTtlHint")}${renderRuntimeRow(model.adminSessionTtl, "86400", "settings.adminSessionTtlHint")}</div></section>
-      <div class="modal-shell" id="create-provider-modal" hidden><div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="create-provider-title"><div class="modal-head"><div><p class="eyebrow mono" data-i18n="settings.createProvider">Add provider</p><h2 id="create-provider-title" data-i18n="settings.createProvider">Add provider</h2></div><button type="button" class="icon-btn" data-close-provider-create-modal data-aria-label-i18n="common.close">${icon("close")}</button></div><form method="post" action="/admin/settings/provider" class="modal-form"><label class="field"><span class="field-label" data-i18n="settings.providerName">Provider name</span><input type="text" name="name" required /></label><label class="field"><span class="field-label" data-i18n="settings.providerUrl">Provider URL</span><input type="url" name="url" required /></label><div class="modal-actions"><button type="button" class="ghost-btn" data-close-provider-create-modal data-i18n="common.cancel">Cancel</button><button type="submit" class="primary-btn">${icon("plus")}<span data-i18n="settings.saveProvider">Save provider</span></button></div></form></div></div>`,
+      <div class="modal-shell" id="create-provider-modal" hidden><div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="create-provider-title"><div class="modal-head"><div><p class="eyebrow mono" data-i18n="settings.createProvider">Add provider</p><h2 id="create-provider-title" data-i18n="settings.createProvider">Add provider</h2></div><button type="button" class="icon-btn" data-close-provider-create-modal data-aria-label-i18n="common.close">${icon("close")}</button></div><form method="post" action="/admin/settings/provider" class="modal-form"><label class="field"><span class="field-label" data-i18n="settings.providerName">Provider name</span><input type="text" name="name" required /></label><label class="field"><span class="field-label" data-i18n="settings.providerUrl">Provider URL</span><input type="url" name="url" required /></label><div class="modal-actions"><button type="button" class="ghost-btn" data-close-provider-create-modal data-i18n="common.cancel">Cancel</button><button type="submit" class="primary-btn">${icon("plus")}<span data-i18n="settings.saveProvider">Save provider</span></button></div></form></div></div>
+      <div class="modal-shell" id="edit-provider-modal" hidden><div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="edit-provider-title"><div class="modal-head"><div><p class="eyebrow mono" data-i18n="common.edit">Edit</p><h2 id="edit-provider-title" data-i18n="common.edit">Edit</h2></div><button type="button" class="icon-btn" data-close-provider-edit-modal data-aria-label-i18n="common.close">${icon("close")}</button></div><form id="edit-provider-form" method="post" action="/admin/settings/provider" class="modal-form"><input type="hidden" name="oldName" id="edit-provider-old-name" /><label class="field"><span class="field-label" data-i18n="settings.providerName">Provider name</span><input id="edit-provider-name" type="text" name="name" required /></label><label class="field"><span class="field-label" data-i18n="settings.providerUrl">Provider URL</span><input id="edit-provider-url" type="url" name="url" required /></label><div class="modal-actions"><button type="button" class="ghost-btn" data-close-provider-edit-modal data-i18n="common.cancel">Cancel</button><button type="submit" class="primary-btn">${icon("edit")}<span data-i18n="common.edit">Edit</span></button></div></form></div></div>`,
   });
 }
 
@@ -2216,6 +2218,10 @@ function renderDocument(options: {
       }
       function setupSettings() {
         const providerCreateModal = document.getElementById("create-provider-modal");
+        const providerEditModal = document.getElementById("edit-provider-modal");
+        const providerEditOldName = document.getElementById("edit-provider-old-name");
+        const providerEditName = document.getElementById("edit-provider-name");
+        const providerEditUrl = document.getElementById("edit-provider-url");
         document.querySelectorAll("[data-secret-toggle]").forEach((button) => {
           button.addEventListener("click", () => {
             const target = document.getElementById(button.getAttribute("data-secret-toggle") || "");
@@ -2239,6 +2245,25 @@ function renderDocument(options: {
         if (providerCreateModal) {
           providerCreateModal.addEventListener("click", (event) => {
             if (event.target === providerCreateModal) providerCreateModal.hidden = true;
+          });
+        }
+        document.querySelectorAll("[data-open-provider-edit]").forEach((button) => {
+          button.addEventListener("click", () => {
+            if (!providerEditModal || !providerEditOldName || !providerEditName || !providerEditUrl) return;
+            providerEditOldName.value = button.getAttribute("data-provider-name") || "";
+            providerEditName.value = button.getAttribute("data-provider-name") || "";
+            providerEditUrl.value = button.getAttribute("data-provider-url") || "";
+            providerEditModal.hidden = false;
+          });
+        });
+        document.querySelectorAll("[data-close-provider-edit-modal]").forEach((button) => {
+          button.addEventListener("click", () => {
+            if (providerEditModal) providerEditModal.hidden = true;
+          });
+        });
+        if (providerEditModal) {
+          providerEditModal.addEventListener("click", (event) => {
+            if (event.target === providerEditModal) providerEditModal.hidden = true;
           });
         }
         document.querySelectorAll("[data-test-provider]").forEach((button) => {

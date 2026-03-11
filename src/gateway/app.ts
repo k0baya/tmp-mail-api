@@ -1970,6 +1970,74 @@ async function setProviderDisabledState(
   return buildSettingsLocation("provider_disabled", { name: normalized });
 }
 
+async function saveProviderDefinition(
+  oldName: string | null,
+  name: string,
+  url: string,
+): Promise<string> {
+  const normalizedName = normalizeProviderName(name);
+  const normalizedOld = oldName ? normalizeProviderName(oldName) : null;
+  const rows = await getResolvedProviderEntries();
+  const existing = rows.find((provider) => provider.name === normalizedName);
+  const current = normalizedOld
+    ? rows.find((provider) => provider.name === normalizedOld)
+    : null;
+
+  if (normalizedOld && !current) {
+    throw new HttpError(404, `Provider "${normalizedOld}" not found.`);
+  }
+  if (normalizedOld && current && current.source !== "kv") {
+    throw new HttpError(400, `Provider "${normalizedOld}" cannot be edited here.`);
+  }
+
+  if (normalizedOld && normalizedOld !== normalizedName) {
+    if (existing) {
+      throw new HttpError(400, `Provider "${normalizedName}" already exists.`);
+    }
+    const disabledConfig = await resolveProviderDisabledConfig(normalizedOld);
+    if (disabledConfig.locked) {
+      throw new HttpError(
+        400,
+        `Provider "${normalizedOld}" has a disabled state locked by environment variable and cannot be renamed here.`,
+      );
+    }
+    const defaultConfig = await resolveConfigValue("DEFAULT_PROVIDER", "legacy");
+    if (
+      defaultConfig.locked &&
+      defaultConfig.value.trim().toLowerCase() === normalizedOld
+    ) {
+      throw new HttpError(
+        400,
+        `Provider "${normalizedOld}" is referenced by a locked DEFAULT_PROVIDER and cannot be renamed here.`,
+      );
+    }
+
+    await setKvConfigValue(`PROVIDER_URL_${normalizedName.toUpperCase()}`, url);
+    if (disabledConfig.source === "kv") {
+      await setKvConfigValue(
+        providerDisabledConfigKey(normalizedName),
+        disabledConfig.value,
+      );
+      await deleteKvConfigValue(providerDisabledConfigKey(normalizedOld));
+    }
+    await deleteKvConfigValue(`PROVIDER_URL_${normalizedOld.toUpperCase()}`);
+
+    if (defaultConfig.value.trim().toLowerCase() === normalizedOld) {
+      await setKvConfigValue("DEFAULT_PROVIDER", normalizedName);
+    }
+    return buildSettingsLocation("provider_saved", { name: normalizedName });
+  }
+
+  if (existing && existing.source !== "kv") {
+    throw new HttpError(
+      400,
+      `Provider "${normalizedName}" already exists (source: ${existing.source}).`,
+    );
+  }
+  await setKvConfigValue(`PROVIDER_URL_${normalizedName.toUpperCase()}`, url);
+  return buildSettingsLocation("provider_saved", { name: normalizedName });
+}
+
 async function handleStats(): Promise<Response> {
   const stats = await getProxyStats();
   return jsonEnvelope(200, true, {
@@ -2155,20 +2223,15 @@ async function routeAdmin(ctx: RequestContext): Promise<Response> {
   if (ctx.request.method === "POST" && ctx.url.pathname === "/admin/settings/provider") {
     verifyAdminPostOrigin(ctx.request, ctx.url);
     const form = await ctx.request.formData();
+    const oldNameRaw = String(form.get("oldName") ?? "").trim();
     const name = validateProviderName(String(form.get("name") ?? ""));
     const url = normalizeProviderUrl(String(form.get("url") ?? ""));
-    const existing = (await getResolvedProviderEntries()).find((provider) => provider.name === name);
-    if (existing && existing.source !== "kv") {
-      throw new HttpError(400, `Provider "${name}" already exists (source: ${existing.source}).`);
-    }
-    if (existing && existing.source === "kv") {
-      await setKvConfigValue(`PROVIDER_URL_${name.toUpperCase()}`, url);
-      return redirectResponse(buildSettingsLocation("provider_saved", { name }), 303, {
-        "cache-control": "no-store",
-      });
-    }
-    await setKvConfigValue(`PROVIDER_URL_${name.toUpperCase()}`, url);
-    return redirectResponse(buildSettingsLocation("provider_saved", { name }), 303, {
+    const nextLocation = await saveProviderDefinition(
+      oldNameRaw || null,
+      name,
+      url,
+    );
+    return redirectResponse(nextLocation, 303, {
       "cache-control": "no-store",
     });
   }
