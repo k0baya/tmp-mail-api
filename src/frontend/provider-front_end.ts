@@ -1511,8 +1511,8 @@ function renderDocument(options: {
   <script>
     (() => {
       try {
-        const themePref = localStorage.getItem("gptmail_theme") || "system";
-        const langPref = localStorage.getItem("gptmail_lang") || "auto";
+        const themePref = localStorage.getItem("tmpmail_theme") || "system";
+        const langPref = localStorage.getItem("tmpmail_lang") || "auto";
         const resolvedTheme = themePref === "system"
           ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
           : themePref;
@@ -1863,6 +1863,10 @@ function renderDocument(options: {
         gap: 12px;
         align-items: center;
       }
+      .topbar-brand { flex-wrap: nowrap; min-width: 0; }
+      .topbar-brand .eyebrow { display: none; }
+      .brand-lockup { min-width: 0; }
+      .brand-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; }
       .toolbar-cluster {
         width: auto;
         gap: 8px;
@@ -1926,6 +1930,24 @@ function renderDocument(options: {
         scroll-behavior: auto !important;
       }
     }
+    .site-footer {
+      text-align: center;
+      padding: 18px 16px 14px;
+      font-size: 13px;
+      color: var(--text-secondary);
+      border-top: 1px solid var(--border);
+      margin-top: auto;
+    }
+    .site-footer a {
+      color: var(--text-secondary);
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: color var(--motion-fast);
+    }
+    .site-footer a:hover { color: var(--text-primary); }
+    .site-footer svg { vertical-align: middle; }
   </style>
 </head>
 <body class="${escapeHtml(options.bodyClass)}" data-page="${escapeHtml(options.pageId)}">
@@ -1933,7 +1955,7 @@ function renderDocument(options: {
   <script>
     (() => {
       const dict = ${JSON.stringify(uiDictionary)};
-      const storageKeys = { theme: "gptmail_theme", lang: "gptmail_lang" };
+      const storageKeys = { theme: "tmpmail_theme", lang: "tmpmail_lang" };
       const themeMedia = window.matchMedia("(prefers-color-scheme: dark)");
       function readValue(locale, key) {
         let current = dict[locale] || dict.en;
@@ -2265,6 +2287,12 @@ function renderDocument(options: {
       setupSettings();
     })();
   </script>
+  <footer class="site-footer">
+    <a href="https://github.com/k0baya/tmp-mail-api" target="_blank" rel="noopener noreferrer">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      k0baya/tmp-mail-api
+    </a>
+  </footer>
 </body>
 </html>`;
 }

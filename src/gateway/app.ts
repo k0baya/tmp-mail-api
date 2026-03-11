@@ -132,7 +132,7 @@ const CONFIG = {
   PROVIDER_URL_LINSHIYOUXIANG: "",
   ADMIN_PASSWORD: "",
   ADMIN_COOKIE_SECRET: "",
-  ADMIN_COOKIE_NAME: "gptmail_admin",
+  ADMIN_COOKIE_NAME: "tmpmail_admin",
   ADMIN_SESSION_TTL_SEC: 86_400,
   MAIL_ID_TTL_MS: 24 * 60 * 60 * 1000,
 } as const;
@@ -160,7 +160,7 @@ function envNonNegativeIntSync(key: string, fallback: number): number {
 
 const ADMIN_PASSWORD = envSync("ADMIN_PASSWORD");
 const ADMIN_COOKIE_SECRET = envSync("ADMIN_COOKIE_SECRET");
-const ADMIN_COOKIE_NAME = envSync("ADMIN_COOKIE_NAME", "gptmail_admin");
+const ADMIN_COOKIE_NAME = envSync("ADMIN_COOKIE_NAME", "tmpmail_admin");
 const MAX_UPSTREAM_CALLS_PER_REQUEST = 50;
 const DOCS_CACHE_TTL_MS = 60_000;
 
@@ -924,19 +924,20 @@ async function assertMailOperationsConfigured(): Promise<void> {
 
 async function resolveProvider(providerParam: unknown): Promise<ProviderTarget> {
   const endpoints = await getProviderEndpoints();
-  const defaultProvider = await envAsync("DEFAULT_PROVIDER", "legacy");
-  const name =
+  const defaultProvider = (await envAsync("DEFAULT_PROVIDER", "legacy")).trim().toLowerCase();
+  const requested =
     providerParam === undefined || providerParam === null || providerParam === ""
-      ? defaultProvider.trim().toLowerCase()
+      ? defaultProvider
       : String(providerParam).trim().toLowerCase();
-  const url = endpoints[name];
-  if (!url) {
-    throw new HttpError(
-      400,
-      `Unknown provider: ${name}. Available: ${Object.keys(endpoints).join(", ") || "(none configured)"}`,
-    );
-  }
-  return { name, url };
+  const url = endpoints[requested];
+  if (url) return { name: requested, url };
+  // Fallback to default provider when the requested one is unknown or disabled.
+  const defaultUrl = endpoints[defaultProvider];
+  if (defaultUrl) return { name: defaultProvider, url: defaultUrl };
+  throw new HttpError(
+    503,
+    `No available provider. Requested "${requested}" is unavailable and default provider "${defaultProvider}" is also unavailable.`,
+  );
 }
 
 function auditConfigChange(key: string, action: "set" | "delete", valuePreview: string): void {
@@ -1094,7 +1095,7 @@ async function createApiKeyRecord(params: {
   expiresAt: number | null;
 }): Promise<{ record: ApiKeyRecord; rawKey: string }> {
   const id = await allocateNextApiKeyId();
-  const rawKey = `gptmail_${randomHex(16)}`;
+  const rawKey = `sk-${randomHex(16)}`;
   const keyHash = await sha256Hex(rawKey);
   const timestamp = nowMs();
   const record: ApiKeyRecord = {
@@ -1631,9 +1632,11 @@ async function buildSettingsPageModel(url: URL): Promise<{
   };
 }
 
+const GITHUB_FOOTER_HTML = `<footer style="position:fixed;bottom:0;left:0;right:0;text-align:center;padding:12px;font-size:13px"><a href="https://github.com/k0baya/tmp-mail-api" target="_blank" rel="noopener noreferrer" style="color:#888;text-decoration:none;display:inline-flex;align-items:center;gap:6px"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>k0baya/tmp-mail-api</a></footer>`;
+
 function fallbackResponse(status: number, message: string): Response {
   return new Response(
-    `<!doctype html><html><head><meta charset="utf-8"><title>Service Unavailable</title><style>body{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#0a0a0a;color:#fafafa}.c{text-align:center;max-width:480px;padding:2rem}h1{font-size:3rem;font-weight:200;margin:0 0 1rem}p{color:#888;line-height:1.6}</style></head><body><div class="c"><h1>${status}</h1><p>${escapeHtml(message)}</p></div></body></html>`,
+    `<!doctype html><html><head><meta charset="utf-8"><title>Service Unavailable</title><style>body{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#0a0a0a;color:#fafafa}.c{text-align:center;max-width:480px;padding:2rem}h1{font-size:3rem;font-weight:200;margin:0 0 1rem}p{color:#888;line-height:1.6}</style></head><body><div class="c"><h1>${status}</h1><p>${escapeHtml(message)}</p></div>${GITHUB_FOOTER_HTML}</body></html>`,
     {
       status,
       headers: { "content-type": "text/html; charset=utf-8" },
@@ -1643,7 +1646,7 @@ function fallbackResponse(status: number, message: string): Response {
 
 function errorPage(status: number, title: string, message: string): Response {
   return new Response(
-    `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#0a0a0a;color:#fafafa}.c{text-align:center;max-width:480px;padding:2rem}h1{font-size:3rem;font-weight:200;margin:0 0 1rem}p{color:#888;line-height:1.6}a{color:#60a5fa}</style></head><body><div class="c"><h1>${status}</h1><p>${escapeHtml(message)}</p></div></body></html>`,
+    `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#0a0a0a;color:#fafafa}.c{text-align:center;max-width:480px;padding:2rem}h1{font-size:3rem;font-weight:200;margin:0 0 1rem}p{color:#888;line-height:1.6}a{color:#60a5fa}</style></head><body><div class="c"><h1>${status}</h1><p>${escapeHtml(message)}</p></div>${GITHUB_FOOTER_HTML}</body></html>`,
     {
       status,
       headers: { "content-type": "text/html; charset=utf-8" },
