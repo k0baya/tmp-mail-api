@@ -1,5 +1,7 @@
 import { DOMParser } from "https://deno.land/x/deno_dom@v0.1.48/deno-dom-wasm.ts";
 
+type JsonRecord = Record<string, unknown>;
+
 type LinshiSessionRecord = {
   cookies: Record<string, string>;
   mailCode: string;
@@ -35,6 +37,9 @@ const CONFIG = {
   LINSHI_BASE_URL: "https://www.linshiyouxiang.net",
   LINSHI_SESSION_TTL_MS: 3_000_000,
   LINSHI_MAX_DETAIL_FETCH: 0,
+  PROVIDER_MEMORY_CACHE_TTL_MS: 5 * 60 * 1000,
+  PROVIDER_KV_WRITE_MIN_INTERVAL_MS: 30 * 1000,
+  LINSHI_MAIL_META_TTL_MS: 15 * 60 * 1000,
 } as const;
 
 function env(key: string, fallback?: string): string {
@@ -65,6 +70,18 @@ const LINSHI_BASE_URL = env(
 ).replace(/\/$/, "");
 const LINSHI_SESSION_TTL_MS = envPositiveInt("LINSHI_SESSION_TTL_MS", 3_000_000);
 const LINSHI_MAX_DETAIL_FETCH = envNonNegativeInt("LINSHI_MAX_DETAIL_FETCH", 0);
+const PROVIDER_MEMORY_CACHE_TTL_MS = envPositiveInt(
+  "PROVIDER_MEMORY_CACHE_TTL_MS",
+  5 * 60 * 1000,
+);
+const PROVIDER_KV_WRITE_MIN_INTERVAL_MS = envPositiveInt(
+  "PROVIDER_KV_WRITE_MIN_INTERVAL_MS",
+  30 * 1000,
+);
+const LINSHI_MAIL_META_TTL_MS = envPositiveInt(
+  "LINSHI_MAIL_META_TTL_MS",
+  15 * 60 * 1000,
+);
 
 if (!PROVIDER_SECRET) {
   throw new Error("Missing required configuration: PROVIDER_SECRET");
@@ -77,6 +94,14 @@ const keyBuilders = {
   linshiMailMeta: (email: string, mailId: string) =>
     ["linshi_mail_meta", email, mailId] as const,
 };
+const linshiSessionCache = new Map<
+  string,
+  { session: LinshiSessionRecord; expiresAt: number; lastPersistedAt: number }
+>();
+const linshiMailMetaCache = new Map<
+  string,
+  { meta: LinshiMailMeta; expiresAt: number }
+>();
 
 function nowMs(): number {
   return Date.now();
@@ -140,14 +165,82 @@ async function countedFetch(
 async function loadLinshiSession(
   email: string,
 ): Promise<LinshiSessionRecord | null> {
+  const cached = linshiSessionCache.get(email);
+  if (cached && cached.expiresAt > nowMs()) {
+    return {
+      ...cached.session,
+      cookies: { ...cached.session.cookies },
+    };
+  }
+  if (cached) linshiSessionCache.delete(email);
   const entry = await kv.get<LinshiSessionRecord>(keyBuilders.linshiSession(email));
+  if (entry.value) {
+    linshiSessionCache.set(email, {
+      session: entry.value,
+      expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
+      lastPersistedAt: nowMs(),
+    });
+  }
   return entry.value ?? null;
 }
 
-async function saveLinshiSession(session: LinshiSessionRecord): Promise<void> {
+async function saveLinshiSession(
+  session: LinshiSessionRecord,
+  force = false,
+): Promise<void> {
+  const cached = linshiSessionCache.get(session.email);
+  linshiSessionCache.set(session.email, {
+    session,
+    expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
+    lastPersistedAt: cached?.lastPersistedAt ?? 0,
+  });
+  if (
+    !force &&
+    cached &&
+    nowMs() - cached.lastPersistedAt < PROVIDER_KV_WRITE_MIN_INTERVAL_MS
+  ) {
+    console.log(JSON.stringify({
+      level: "info",
+      type: "provider_write_throttled",
+      provider: "linshiyouxiang",
+      email: session.email,
+    }));
+    return;
+  }
   await kv.set(keyBuilders.linshiSession(session.email), session, {
     expireIn: LINSHI_SESSION_TTL_MS,
   });
+  linshiSessionCache.set(session.email, {
+    session,
+    expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
+    lastPersistedAt: nowMs(),
+  });
+}
+
+function linshiMailMetaCacheKey(email: string, mailId: string): string {
+  return `${email}:${mailId}`;
+}
+
+function setLinshiMailMeta(
+  email: string,
+  mailId: string,
+  meta: LinshiMailMeta,
+): void {
+  linshiMailMetaCache.set(linshiMailMetaCacheKey(email, mailId), {
+    meta,
+    expiresAt: nowMs() + LINSHI_MAIL_META_TTL_MS,
+  });
+}
+
+function getLinshiMailMeta(email: string, mailId: string): LinshiMailMeta | null {
+  const cacheKey = linshiMailMetaCacheKey(email, mailId);
+  const entry = linshiMailMetaCache.get(cacheKey);
+  if (!entry) return null;
+  if (entry.expiresAt <= nowMs()) {
+    linshiMailMetaCache.delete(cacheKey);
+    return null;
+  }
+  return entry.meta;
 }
 
 function mergeSetCookies(
@@ -318,7 +411,7 @@ function linshiParseMailList(html: string): Array<{
       timestamp: string;
     }> = [];
     for (const row of tbody.querySelectorAll("tr.unread, tr.read")) {
-      if ((row as Element & { id?: string }).id === "loading-row") continue;
+      if ((row as { id?: string }).id === "loading-row") continue;
       const links = row.querySelectorAll("a");
       if (!links.length) continue;
       const href = links[0].getAttribute("href") ?? "";
@@ -411,11 +504,11 @@ async function refreshAndCacheMailList(
   };
   const rawList = linshiParseMailList(home.html);
   for (const item of rawList) {
-    await kv.set(keyBuilders.linshiMailMeta(email, item.id), {
+    setLinshiMailMeta(email, item.id, {
       sender: item.sender,
       subject: item.subject,
       timestamp: item.timestamp,
-    } satisfies LinshiMailMeta, { expireIn: LINSHI_SESSION_TTL_MS });
+    } satisfies LinshiMailMeta);
   }
   await saveLinshiSession(nextSession);
   return { session: nextSession, rawList };
@@ -441,7 +534,7 @@ async function handleGenerateEmail(
     createdAt: nowMs(),
     updatedAt: nowMs(),
   };
-  await saveLinshiSession(session);
+  await saveLinshiSession(session, true);
   return providerResponse(ctx, 200, true, { email: gmail.email }, "");
 }
 
@@ -503,18 +596,18 @@ async function handleEmailDetail(
   if (!session) throw new ProviderError(404, "No active session for this email.");
   const detail = await linshiGetMailContent(ctx, session, mailId);
   session = detail.session;
-  let meta = await kv.get<LinshiMailMeta>(keyBuilders.linshiMailMeta(email, mailId));
-  if (!meta.value) {
+  let meta = getLinshiMailMeta(email, mailId);
+  if (!meta) {
     const refreshed = await refreshAndCacheMailList(ctx, session, email);
     session = refreshed.session;
-    meta = await kv.get<LinshiMailMeta>(keyBuilders.linshiMailMeta(email, mailId));
+    meta = getLinshiMailMeta(email, mailId);
   }
   await saveLinshiSession({ ...session, updatedAt: nowMs() });
   return providerResponse(ctx, 200, true, {
     id: mailId,
     email_address: email,
-    from_address: meta.value?.sender ?? "",
-    subject: meta.value?.subject ?? "",
+    from_address: meta?.sender ?? "",
+    subject: meta?.subject ?? "",
     content: linshiHtmlToText(detail.html),
     html_content: detail.html,
   }, "");

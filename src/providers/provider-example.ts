@@ -29,7 +29,11 @@
  * 5. Throw ProviderError(status, message) for expected failures.
  *    Unexpected errors are caught automatically and returned as 500.
  *
- * 6. Persist session/account data in Deno KV with an appropriate TTL.
+ * 6. Persist session/account data in Deno KV with an appropriate TTL,
+ *    but prefer a MEMORY-FIRST pattern on hot paths:
+ *    - read from in-process cache first
+ *    - use KV as fallback / cold-start recovery
+ *    - throttle KV writes when only timestamps or refresh tokens changed
  *    TTL MUST NOT exceed 86 400 000 ms (24 hours). Shorter is better.
  *    Deno Deploy KV space is limited (1 GiB free / 5 GiB pro) and
  *    write units are billed monthly. Long TTLs waste both.
@@ -96,6 +100,10 @@ const CONFIG = {
   ACCOUNT_TTL_MS: 24 * 60 * 60 * 1000, // 24 hours — hard ceiling, never exceed
   /** If the token is older than this, refresh before use (ms). */
   TOKEN_REFRESH_INTERVAL_MS: 10 * 60 * 1000, // 10 minutes
+  /** Optional in-memory hot cache TTL (ms). */
+  PROVIDER_MEMORY_CACHE_TTL_MS: 5 * 60 * 1000,
+  /** Optional minimum interval between KV writes for the same record (ms). */
+  PROVIDER_KV_WRITE_MIN_INTERVAL_MS: 30 * 1000,
 } as const;
 
 // ─── Env helpers ─────────────────────────────────────────────────────
@@ -126,6 +134,14 @@ const TOKEN_REFRESH_INTERVAL_MS = envPositiveInt(
   "TOKEN_REFRESH_INTERVAL_MS",
   600_000,
 );
+const PROVIDER_MEMORY_CACHE_TTL_MS = envPositiveInt(
+  "PROVIDER_MEMORY_CACHE_TTL_MS",
+  300_000,
+);
+const PROVIDER_KV_WRITE_MIN_INTERVAL_MS = envPositiveInt(
+  "PROVIDER_KV_WRITE_MIN_INTERVAL_MS",
+  30_000,
+);
 
 // ─── Deno KV ─────────────────────────────────────────────────────────
 
@@ -139,6 +155,10 @@ const kv = await Deno.openKv();
 const keyBuilders = {
   account: (email: string) => ["example_account", email] as const,
 };
+const accountCache = new Map<
+  string,
+  { account: AccountRecord; expiresAt: number; lastPersistedAt: number }
+>();
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -202,13 +222,43 @@ async function countedFetch(
 // ─── KV persistence ──────────────────────────────────────────────────
 
 async function loadAccount(email: string): Promise<AccountRecord | null> {
+  const cached = accountCache.get(email);
+  if (cached && cached.expiresAt > nowMs()) {
+    return { ...cached.account };
+  }
+  if (cached) accountCache.delete(email);
   const entry = await kv.get<AccountRecord>(keyBuilders.account(email));
+  if (entry.value) {
+    accountCache.set(email, {
+      account: entry.value,
+      expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
+      lastPersistedAt: nowMs(),
+    });
+  }
   return entry.value ?? null;
 }
 
-async function saveAccount(account: AccountRecord): Promise<void> {
+async function saveAccount(account: AccountRecord, force = false): Promise<void> {
+  const cached = accountCache.get(account.address);
+  accountCache.set(account.address, {
+    account,
+    expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
+    lastPersistedAt: cached?.lastPersistedAt ?? 0,
+  });
+  if (
+    !force &&
+    cached &&
+    nowMs() - cached.lastPersistedAt < PROVIDER_KV_WRITE_MIN_INTERVAL_MS
+  ) {
+    return;
+  }
   await kv.set(keyBuilders.account(account.address), account, {
     expireIn: ACCOUNT_TTL_MS,
+  });
+  accountCache.set(account.address, {
+    account,
+    expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
+    lastPersistedAt: nowMs(),
   });
 }
 

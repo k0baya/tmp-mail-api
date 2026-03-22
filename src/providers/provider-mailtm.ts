@@ -39,6 +39,8 @@ const CONFIG = {
   UPSTREAM_BASE: "https://api.mail.tm",
   ACCOUNT_TTL_MS: 24 * 60 * 60 * 1000,
   TOKEN_REFRESH_INTERVAL_MS: 10 * 60 * 1000,
+  PROVIDER_MEMORY_CACHE_TTL_MS: 5 * 60 * 1000,
+  PROVIDER_KV_WRITE_MIN_INTERVAL_MS: 30 * 1000,
 } as const;
 
 function env(key: string, fallback?: string): string {
@@ -58,6 +60,14 @@ const PROVIDER_SECRET = env("PROVIDER_SECRET");
 const UPSTREAM_BASE = env("UPSTREAM_BASE", "https://api.mail.tm").replace(/\/$/, "");
 const ACCOUNT_TTL_MS = envPositiveInt("ACCOUNT_TTL_MS", 24 * 60 * 60 * 1000);
 const TOKEN_REFRESH_INTERVAL_MS = envPositiveInt("TOKEN_REFRESH_INTERVAL_MS", 10 * 60 * 1000);
+const PROVIDER_MEMORY_CACHE_TTL_MS = envPositiveInt(
+  "PROVIDER_MEMORY_CACHE_TTL_MS",
+  5 * 60 * 1000,
+);
+const PROVIDER_KV_WRITE_MIN_INTERVAL_MS = envPositiveInt(
+  "PROVIDER_KV_WRITE_MIN_INTERVAL_MS",
+  30 * 1000,
+);
 
 if (!PROVIDER_SECRET) {
   throw new Error("Missing required configuration: PROVIDER_SECRET");
@@ -68,6 +78,10 @@ const kv = await Deno.openKv();
 const keyBuilders = {
   account: (email: string) => ["mailtm_account", email] as const,
 };
+const accountCache = new Map<
+  string,
+  { account: AccountRecord; expiresAt: number; lastPersistedAt: number }
+>();
 
 function nowMs(): number {
   return Date.now();
@@ -194,12 +208,48 @@ async function fetchToken(
 }
 
 async function loadAccount(email: string): Promise<AccountRecord | null> {
+  const cached = accountCache.get(email);
+  if (cached && cached.expiresAt > nowMs()) {
+    return { ...cached.account };
+  }
+  if (cached) accountCache.delete(email);
   const entry = await kv.get<AccountRecord>(keyBuilders.account(email));
+  if (entry.value) {
+    accountCache.set(email, {
+      account: entry.value,
+      expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
+      lastPersistedAt: nowMs(),
+    });
+  }
   return entry.value ?? null;
 }
 
-async function saveAccount(account: AccountRecord): Promise<void> {
+async function saveAccount(account: AccountRecord, force = false): Promise<void> {
+  const cached = accountCache.get(account.address);
+  accountCache.set(account.address, {
+    account,
+    expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
+    lastPersistedAt: cached?.lastPersistedAt ?? 0,
+  });
+  if (
+    !force &&
+    cached &&
+    nowMs() - cached.lastPersistedAt < PROVIDER_KV_WRITE_MIN_INTERVAL_MS
+  ) {
+    console.log(JSON.stringify({
+      level: "info",
+      type: "provider_write_throttled",
+      provider: "mailtm",
+      email: account.address,
+    }));
+    return;
+  }
   await kv.set(keyBuilders.account(account.address), account, { expireIn: ACCOUNT_TTL_MS });
+  accountCache.set(account.address, {
+    account,
+    expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
+    lastPersistedAt: nowMs(),
+  });
 }
 
 async function getValidToken(
@@ -273,7 +323,7 @@ async function handleGenerateEmail(
     createdAt: nowMs(),
     updatedAt: nowMs(),
   };
-  await saveAccount(account);
+  await saveAccount(account, true);
   return providerResponse(ctx, 200, true, { email: address }, "");
 }
 

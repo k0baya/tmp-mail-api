@@ -107,6 +107,23 @@ type ResolvedConfigValue = {
   locked: boolean;
 };
 
+type UsageCounterSnapshot = {
+  total: number;
+  daily: number;
+};
+
+type AuthCacheEntry = {
+  expiresAt: number;
+  keyId: string | null;
+  keyRecord: ApiKeyRecord | null;
+};
+
+type ProxyStatsSnapshot = {
+  totalUpstreamCalls: number;
+  todayUpstreamCalls: number;
+  activeApiKeys: number;
+};
+
 type Locale = "en" | "zh";
 type ThemeMode = "system" | "light" | "dark";
 
@@ -163,8 +180,39 @@ const ADMIN_COOKIE_SECRET = envSync("ADMIN_COOKIE_SECRET");
 const ADMIN_COOKIE_NAME = envSync("ADMIN_COOKIE_NAME", "tmpmail_admin");
 const MAX_UPSTREAM_CALLS_PER_REQUEST = 50;
 const DOCS_CACHE_TTL_MS = 60_000;
+const AUTH_CACHE_TTL_MS = envPositiveIntSync("AUTH_CACHE_TTL_MS", 60_000);
+const AUTH_NEGATIVE_CACHE_TTL_MS = envPositiveIntSync(
+  "AUTH_NEGATIVE_CACHE_TTL_MS",
+  5_000,
+);
+const STATS_CACHE_TTL_MS = envPositiveIntSync("STATS_CACHE_TTL_MS", 10_000);
+const MAIL_ID_MEMORY_TTL_MS = envPositiveIntSync(
+  "MAIL_ID_MEMORY_TTL_MS",
+  900_000,
+);
+const METRIC_FLUSH_INTERVAL_MS = Math.min(
+  envPositiveIntSync("METRIC_FLUSH_INTERVAL_MS", 5_000),
+  180_000,
+);
+const METRIC_FLUSH_MAX_PENDING = envPositiveIntSync(
+  "METRIC_FLUSH_MAX_PENDING",
+  256,
+);
 
 let docsPageCache = new Map<string, { html: string; expiresAt: number }>();
+let authCache = new Map<string, AuthCacheEntry>();
+let proxyStatsCache: { value: ProxyStatsSnapshot; expiresAt: number } | null =
+  null;
+let mailIdMemoryCache = new Map<
+  string,
+  { email: string; expiresAt: number }
+>();
+let pendingMetricSums = new Map<
+  string,
+  { key: readonly (string | number | bigint)[]; amount: bigint }
+>();
+let metricFlushTimer: ReturnType<typeof setTimeout> | null = null;
+let metricFlushPromise: Promise<void> | null = null;
 
 if (!ADMIN_PASSWORD) {
   throw new Error("Missing required configuration: ADMIN_PASSWORD");
@@ -220,6 +268,79 @@ async function loadKvConfig(): Promise<Record<string, string>> {
 function invalidateConfigCache(): void {
   configCache = null;
   configCacheAt = 0;
+}
+
+function invalidateProxyStatsCache(): void {
+  proxyStatsCache = null;
+}
+
+function invalidateApiKeyAuthCache(keyHash?: string): void {
+  if (keyHash) authCache.delete(keyHash);
+}
+
+function keyHasQuota(record: ApiKeyRecord): boolean {
+  return record.quotaTotal !== null || record.quotaDaily !== null;
+}
+
+function mailIdCacheKey(provider: string, mailId: string): string {
+  return `${provider}:${mailId}`;
+}
+
+function queueMetricFlush(force = false): void {
+  if (metricFlushTimer && !force) return;
+  if (metricFlushTimer) clearTimeout(metricFlushTimer);
+  metricFlushTimer = setTimeout(() => {
+    metricFlushTimer = null;
+    void flushPendingMetricSums();
+  }, force ? 0 : METRIC_FLUSH_INTERVAL_MS);
+}
+
+function bufferMetricSum(
+  key: readonly (string | number | bigint)[],
+  amount: bigint,
+): void {
+  if (amount <= 0n) return;
+  const serialized = JSON.stringify(key);
+  const existing = pendingMetricSums.get(serialized);
+  pendingMetricSums.set(serialized, {
+    key,
+    amount: (existing?.amount ?? 0n) + amount,
+  });
+  queueMetricFlush(pendingMetricSums.size >= METRIC_FLUSH_MAX_PENDING);
+}
+
+async function flushPendingMetricSums(): Promise<void> {
+  if (metricFlushPromise || pendingMetricSums.size === 0) return;
+  const batch = Array.from(pendingMetricSums.values());
+  pendingMetricSums.clear();
+  metricFlushPromise = (async () => {
+    let operation = kv.atomic();
+    for (const entry of batch) {
+      operation = operation.sum(entry.key, entry.amount);
+    }
+    const result = await operation.commit();
+    if (!result.ok) {
+      for (const entry of batch) {
+        bufferMetricSum(entry.key, entry.amount);
+      }
+      console.error(JSON.stringify({
+        level: "error",
+        type: "metric_flush_failed",
+        batchSize: batch.length,
+      }));
+      return;
+    }
+    console.log(JSON.stringify({
+      level: "info",
+      type: "metric_flush_ok",
+      batchSize: batch.length,
+    }));
+  })();
+  try {
+    await metricFlushPromise;
+  } finally {
+    metricFlushPromise = null;
+  }
 }
 
 async function envAsync(key: string, fallback?: string): Promise<string> {
@@ -980,18 +1101,51 @@ async function authenticateApiRequest(
   const rawKey = match[1].trim();
   if (!rawKey) throw new HttpError(401, "Missing or invalid bearer token.");
   const keyHash = await sha256Hex(rawKey);
+  const cached = authCache.get(keyHash);
+  if (cached) {
+    if (cached.expiresAt > nowMs()) {
+      if (!cached.keyId || !cached.keyRecord) {
+        throw new HttpError(401, "Missing or invalid bearer token.");
+      }
+      if (cached.keyRecord.status !== "active") {
+        throw new HttpError(403, "API key is disabled.");
+      }
+      if (cached.keyRecord.expiresAt && cached.keyRecord.expiresAt <= nowMs()) {
+        throw new HttpError(403, "API key is expired.");
+      }
+      return { keyId: cached.keyId, keyRecord: cached.keyRecord };
+    }
+    authCache.delete(keyHash);
+  }
   const keyIdEntry = await kv.get<string>(keyBuilders.apiKeyHash(keyHash));
   if (!keyIdEntry.value) {
+    authCache.set(keyHash, {
+      expiresAt: nowMs() + AUTH_NEGATIVE_CACHE_TTL_MS,
+      keyId: null,
+      keyRecord: null,
+    });
     throw new HttpError(401, "Missing or invalid bearer token.");
   }
   const keyRecordEntry = await kv.get<ApiKeyRecord>(
     keyBuilders.apiKey(keyIdEntry.value),
   );
   const keyRecord = keyRecordEntry.value;
-  if (!keyRecord) throw new HttpError(401, "Missing or invalid bearer token.");
+  if (!keyRecord) {
+    authCache.set(keyHash, {
+      expiresAt: nowMs() + AUTH_NEGATIVE_CACHE_TTL_MS,
+      keyId: null,
+      keyRecord: null,
+    });
+    throw new HttpError(401, "Missing or invalid bearer token.");
+  }
   if (!timingSafeEqual(keyRecord.keyHash, keyHash)) {
     throw new HttpError(401, "Missing or invalid bearer token.");
   }
+  authCache.set(keyHash, {
+    expiresAt: nowMs() + AUTH_CACHE_TTL_MS,
+    keyId: keyRecord.id,
+    keyRecord,
+  });
   if (keyRecord.status !== "active") {
     throw new HttpError(403, "API key is disabled.");
   }
@@ -1003,7 +1157,7 @@ async function authenticateApiRequest(
 
 async function readUsageCounters(
   keyId: string,
-): Promise<{ total: number; daily: number }> {
+): Promise<UsageCounterSnapshot> {
   const [totalEntry, dailyEntry] = await kv.getMany(
     [
       keyBuilders.apiUsageTotal(keyId),
@@ -1016,8 +1170,17 @@ async function readUsageCounters(
   };
 }
 
-async function assertQuotaAvailable(auth: ApiAuthContext): Promise<void> {
-  const usage = await readUsageCounters(auth.keyId);
+async function readUsageSnapshot(auth: ApiAuthContext): Promise<UsageCounterSnapshot> {
+  if (!keyHasQuota(auth.keyRecord)) {
+    return { total: 0, daily: 0 };
+  }
+  return await readUsageCounters(auth.keyId);
+}
+
+function assertQuotaAvailable(
+  auth: ApiAuthContext,
+  usage: UsageCounterSnapshot,
+): void {
   if (
     auth.keyRecord.quotaTotal !== null &&
     usage.total >= auth.keyRecord.quotaTotal
@@ -1032,8 +1195,10 @@ async function assertQuotaAvailable(auth: ApiAuthContext): Promise<void> {
   }
 }
 
-async function computeRemainingQuota(auth: ApiAuthContext): Promise<number | null> {
-  const usage = await readUsageCounters(auth.keyId);
+function computeRemainingQuota(
+  auth: ApiAuthContext,
+  usage: UsageCounterSnapshot,
+): number | null {
   const candidates: number[] = [];
   if (auth.keyRecord.quotaTotal !== null) {
     candidates.push(Math.max(0, auth.keyRecord.quotaTotal - usage.total));
@@ -1052,8 +1217,6 @@ async function incrementUsageCountersBy(keyId: string, count: number): Promise<v
   const result = await kv.atomic()
     .sum(keyBuilders.apiUsageTotal(keyId), n)
     .sum(keyBuilders.apiUsageDaily(keyId, day), n)
-    .sum(keyBuilders.metric("upstream_total"), n)
-    .sum(keyBuilders.metricDay("upstream_total", day), n)
     .commit();
   if (!result.ok) {
     console.error(
@@ -1064,7 +1227,10 @@ async function incrementUsageCountersBy(keyId: string, count: number): Promise<v
         count,
       }),
     );
+    return;
   }
+  bufferMetricSum(keyBuilders.metric("upstream_total"), n);
+  bufferMetricSum(keyBuilders.metricDay("upstream_total", day), n);
 }
 
 async function incrementFailureGuardrail(keyId: string, count: number): Promise<void> {
@@ -1073,8 +1239,6 @@ async function incrementFailureGuardrail(keyId: string, count: number): Promise<
   const n = BigInt(count);
   const result = await kv.atomic()
     .sum(keyBuilders.failureGuardrailDaily(keyId, day), n)
-    .sum(keyBuilders.metric("upstream_failed_total"), n)
-    .sum(keyBuilders.metricDay("upstream_failed_total", day), n)
     .commit();
   if (!result.ok) {
     console.error(
@@ -1085,7 +1249,10 @@ async function incrementFailureGuardrail(keyId: string, count: number): Promise<
         count,
       }),
     );
+    return;
   }
+  bufferMetricSum(keyBuilders.metric("upstream_failed_total"), n);
+  bufferMetricSum(keyBuilders.metricDay("upstream_failed_total", day), n);
 }
 
 async function createApiKeyRecord(params: {
@@ -1118,6 +1285,7 @@ async function createApiKeyRecord(params: {
   if (!result.ok) {
     throw new HttpError(500, "Failed to create API key.");
   }
+  invalidateProxyStatsCache();
   return { record, rawKey };
 }
 
@@ -1136,6 +1304,8 @@ async function updateApiKeyRecord(keyId: string, updates: {
     updatedAt: nowMs(),
   };
   await kv.set(keyBuilders.apiKey(keyId), record);
+  invalidateApiKeyAuthCache(existing.value.keyHash);
+  invalidateProxyStatsCache();
 }
 
 async function deleteApiKeyRecord(keyId: string): Promise<void> {
@@ -1156,6 +1326,8 @@ async function deleteApiKeyRecord(keyId: string): Promise<void> {
   if (!result.ok) {
     throw new HttpError(500, "Failed to delete API key.");
   }
+  invalidateApiKeyAuthCache(existing.value.keyHash);
+  invalidateProxyStatsCache();
 }
 
 async function listApiKeysWithUsage(): Promise<
@@ -1199,39 +1371,50 @@ async function getProxyStats(): Promise<{
   todayUpstreamCalls: number;
   activeApiKeys: number;
 }> {
+  if (proxyStatsCache && proxyStatsCache.expiresAt > nowMs()) {
+    return proxyStatsCache.value;
+  }
   const [totalEntry, dailyEntry] = await kv.getMany(
     [
       keyBuilders.metric("upstream_total"),
       keyBuilders.metricDay("upstream_total", utcDayStamp()),
     ] as const,
   );
-  return {
+  const value = {
     totalUpstreamCalls: totalEntry.value ? Number(totalEntry.value) : 0,
     todayUpstreamCalls: dailyEntry.value ? Number(dailyEntry.value) : 0,
     activeApiKeys: await countActiveApiKeys(),
   };
+  proxyStatsCache = {
+    value,
+    expiresAt: nowMs() + STATS_CACHE_TTL_MS,
+  };
+  return value;
 }
 
-async function saveMailIdMapping(
+function saveMailIdMapping(
   provider: string,
   mailId: string,
   email: string,
-): Promise<void> {
-  const ttlMs = await envPositiveIntAsync(
-    "MAIL_ID_TTL_MS",
-    24 * 60 * 60 * 1000,
-  );
-  await kv.set(keyBuilders.mailToEmail(provider, mailId), email, {
-    expireIn: ttlMs,
+): void {
+  mailIdMemoryCache.set(mailIdCacheKey(provider, mailId), {
+    email,
+    expiresAt: nowMs() + MAIL_ID_MEMORY_TTL_MS,
   });
 }
 
-async function getMailIdMapping(
+function getMailIdMapping(
   provider: string,
   mailId: string,
-): Promise<string | null> {
-  const entry = await kv.get<string>(keyBuilders.mailToEmail(provider, mailId));
-  return entry.value ?? null;
+): string | null {
+  const cacheKey = mailIdCacheKey(provider, mailId);
+  const entry = mailIdMemoryCache.get(cacheKey);
+  if (!entry) return null;
+  if (entry.expiresAt <= nowMs()) {
+    mailIdMemoryCache.delete(cacheKey);
+    return null;
+  }
+  return entry.email;
 }
 
 function tryExtractMailId(value: unknown): string | null {
@@ -1252,19 +1435,19 @@ async function hydrateMailMappings(
     if (!item || typeof item !== "object") continue;
     const mailId = tryExtractMailId((item as Record<string, unknown>).id);
     if (mailId) {
-      await saveMailIdMapping(provider, mailId, email);
+      saveMailIdMapping(provider, mailId, email);
     }
   }
   const directId = tryExtractMailId(record.id);
   if (directId) {
-    await saveMailIdMapping(provider, directId, email);
+    saveMailIdMapping(provider, directId, email);
   }
 }
 
 async function callProvider(
   ctx: RequestContext,
-  auth: ApiAuthContext,
   provider: ProviderTarget,
+  remainingQuota: number | null,
   method: string,
   path: string,
   query?: Record<string, string>,
@@ -1292,9 +1475,8 @@ async function callProvider(
     headers["Content-Type"] = "application/json";
   }
 
-  const remaining = await computeRemainingQuota(auth);
-  if (remaining !== null && remaining > 0) {
-    headers["X-Max-Upstream-Calls"] = String(remaining);
+  if (remainingQuota !== null && remainingQuota > 0) {
+    headers["X-Max-Upstream-Calls"] = String(remainingQuota);
   }
 
   const start = performance.now();
@@ -1369,7 +1551,9 @@ async function handleGenerateEmail(
   auth: ApiAuthContext,
 ): Promise<Response> {
   await assertMailOperationsConfigured();
-  await assertQuotaAvailable(auth);
+  const usage = await readUsageSnapshot(auth);
+  assertQuotaAvailable(auth, usage);
+  const remainingQuota = computeRemainingQuota(auth, usage);
   let providerParam: unknown;
   let payload: JsonRecord = {};
   if (ctx.request.method === "POST") {
@@ -1391,8 +1575,8 @@ async function handleGenerateEmail(
     : undefined;
   const result = await callProvider(
     ctx,
-    auth,
     provider,
+    remainingQuota,
     "POST",
     "/generate-email",
     undefined,
@@ -1417,7 +1601,9 @@ async function handleListEmails(
   auth: ApiAuthContext,
 ): Promise<Response> {
   await assertMailOperationsConfigured();
-  await assertQuotaAvailable(auth);
+  const usage = await readUsageSnapshot(auth);
+  assertQuotaAvailable(auth, usage);
+  const remainingQuota = computeRemainingQuota(auth, usage);
   const email = ctx.url.searchParams.get("email");
   if (!email) throw new HttpError(400, "Query parameter email is required.");
   const provider = await resolveProvider(
@@ -1425,8 +1611,8 @@ async function handleListEmails(
   );
   const result = await callProvider(
     ctx,
-    auth,
     provider,
+    remainingQuota,
     "GET",
     "/emails",
     { email },
@@ -1448,7 +1634,7 @@ async function resolveEmailForMailOperation(
   url: URL,
   providerName: string,
 ): Promise<string | null> {
-  const mapped = await getMailIdMapping(providerName, mailId);
+  const mapped = getMailIdMapping(providerName, mailId);
   if (mapped) return mapped;
   const hinted = url.searchParams.get("email");
   if (hinted) return hinted;
@@ -1461,7 +1647,9 @@ async function handleEmailDetail(
   mailId: string,
 ): Promise<Response> {
   await assertMailOperationsConfigured();
-  await assertQuotaAvailable(auth);
+  const usage = await readUsageSnapshot(auth);
+  assertQuotaAvailable(auth, usage);
+  const remainingQuota = computeRemainingQuota(auth, usage);
   const provider = await resolveProvider(
     ctx.url.searchParams.get("provider") ?? undefined,
   );
@@ -1474,8 +1662,8 @@ async function handleEmailDetail(
   }
   const result = await callProvider(
     ctx,
-    auth,
     provider,
+    remainingQuota,
     "GET",
     `/email/${encodeURIComponent(mailId)}`,
     { email },
@@ -1498,7 +1686,9 @@ async function handleDeleteEmail(
   mailId: string,
 ): Promise<Response> {
   await assertMailOperationsConfigured();
-  await assertQuotaAvailable(auth);
+  const usage = await readUsageSnapshot(auth);
+  assertQuotaAvailable(auth, usage);
+  const remainingQuota = computeRemainingQuota(auth, usage);
   const provider = await resolveProvider(
     ctx.url.searchParams.get("provider") ?? undefined,
   );
@@ -1511,8 +1701,8 @@ async function handleDeleteEmail(
   }
   const result = await callProvider(
     ctx,
-    auth,
     provider,
+    remainingQuota,
     "DELETE",
     `/email/${encodeURIComponent(mailId)}`,
     { email },
@@ -1533,7 +1723,9 @@ async function handleClearEmails(
   auth: ApiAuthContext,
 ): Promise<Response> {
   await assertMailOperationsConfigured();
-  await assertQuotaAvailable(auth);
+  const usage = await readUsageSnapshot(auth);
+  assertQuotaAvailable(auth, usage);
+  const remainingQuota = computeRemainingQuota(auth, usage);
   const email = ctx.url.searchParams.get("email");
   if (!email) throw new HttpError(400, "Query parameter email is required.");
   const provider = await resolveProvider(
@@ -1541,8 +1733,8 @@ async function handleClearEmails(
   );
   const result = await callProvider(
     ctx,
-    auth,
     provider,
+    remainingQuota,
     "DELETE",
     "/emails/clear",
     { email },
