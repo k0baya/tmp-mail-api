@@ -40,7 +40,7 @@ const CONFIG = {
   ACCOUNT_TTL_MS: 24 * 60 * 60 * 1000,
   TOKEN_REFRESH_INTERVAL_MS: 10 * 60 * 1000,
   PROVIDER_MEMORY_CACHE_TTL_MS: 5 * 60 * 1000,
-  PROVIDER_KV_WRITE_MIN_INTERVAL_MS: 30 * 1000,
+  PROVIDER_KV_WRITE_MIN_INTERVAL_MS: 180 * 1000,
 } as const;
 
 function env(key: string, fallback?: string): string {
@@ -64,9 +64,9 @@ const PROVIDER_MEMORY_CACHE_TTL_MS = envPositiveInt(
   "PROVIDER_MEMORY_CACHE_TTL_MS",
   5 * 60 * 1000,
 );
-const PROVIDER_KV_WRITE_MIN_INTERVAL_MS = envPositiveInt(
-  "PROVIDER_KV_WRITE_MIN_INTERVAL_MS",
-  30 * 1000,
+const PROVIDER_KV_WRITE_MIN_INTERVAL_MS = Math.min(
+  envPositiveInt("PROVIDER_KV_WRITE_MIN_INTERVAL_MS", 180 * 1000),
+  180 * 1000,
 );
 
 if (!PROVIDER_SECRET) {
@@ -80,8 +80,15 @@ const keyBuilders = {
 };
 const accountCache = new Map<
   string,
-  { account: AccountRecord; expiresAt: number; lastPersistedAt: number }
+  {
+    account: AccountRecord;
+    expiresAt: number;
+    lastPersistedAt: number;
+    dirty: boolean;
+  }
 >();
+let accountFlushTimer: ReturnType<typeof setTimeout> | null = null;
+let accountFlushPromise: Promise<void> | null = null;
 
 function nowMs(): number {
   return Date.now();
@@ -219,9 +226,74 @@ async function loadAccount(email: string): Promise<AccountRecord | null> {
       account: entry.value,
       expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
       lastPersistedAt: nowMs(),
+      dirty: false,
     });
   }
   return entry.value ?? null;
+}
+
+function queueAccountFlush(force = false): void {
+  if (accountFlushTimer && !force) return;
+  if (accountFlushTimer) clearTimeout(accountFlushTimer);
+  accountFlushTimer = setTimeout(() => {
+    accountFlushTimer = null;
+    void flushDirtyAccounts();
+  }, force ? 0 : PROVIDER_KV_WRITE_MIN_INTERVAL_MS);
+}
+
+async function persistAccount(account: AccountRecord): Promise<void> {
+  await kv.set(keyBuilders.account(account.address), account, {
+    expireIn: ACCOUNT_TTL_MS,
+  });
+  accountCache.set(account.address, {
+    account,
+    expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
+    lastPersistedAt: nowMs(),
+    dirty: false,
+  });
+}
+
+async function flushDirtyAccounts(): Promise<void> {
+  if (accountFlushPromise) return;
+  const dirtyEntries = Array.from(accountCache.values()).filter((entry) =>
+    entry.dirty
+  );
+  if (dirtyEntries.length === 0) return;
+  accountFlushPromise = (async () => {
+    let flushed = 0;
+    for (const entry of dirtyEntries) {
+      const current = accountCache.get(entry.account.address);
+      if (!current?.dirty) continue;
+      try {
+        await persistAccount(current.account);
+        flushed += 1;
+      } catch (error) {
+        console.error(JSON.stringify({
+          level: "error",
+          type: "provider_flush_failed",
+          provider: "mailgw",
+          email: current.account.address,
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      }
+    }
+    if (flushed > 0) {
+      console.log(JSON.stringify({
+        level: "info",
+        type: "provider_flush_ok",
+        provider: "mailgw",
+        flushed,
+      }));
+    }
+  })();
+  try {
+    await accountFlushPromise;
+  } finally {
+    accountFlushPromise = null;
+    if (Array.from(accountCache.values()).some((entry) => entry.dirty)) {
+      queueAccountFlush();
+    }
+  }
 }
 
 async function saveAccount(account: AccountRecord, force = false): Promise<void> {
@@ -230,26 +302,23 @@ async function saveAccount(account: AccountRecord, force = false): Promise<void>
     account,
     expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
     lastPersistedAt: cached?.lastPersistedAt ?? 0,
+    dirty: true,
   });
-  if (
-    !force &&
-    cached &&
-    nowMs() - cached.lastPersistedAt < PROVIDER_KV_WRITE_MIN_INTERVAL_MS
-  ) {
+  if (force || !cached) {
+    await persistAccount(account);
+    return;
+  }
+  if (nowMs() - cached.lastPersistedAt < PROVIDER_KV_WRITE_MIN_INTERVAL_MS) {
     console.log(JSON.stringify({
       level: "info",
       type: "provider_write_throttled",
       provider: "mailgw",
       email: account.address,
     }));
+    queueAccountFlush();
     return;
   }
-  await kv.set(keyBuilders.account(account.address), account, { expireIn: ACCOUNT_TTL_MS });
-  accountCache.set(account.address, {
-    account,
-    expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
-    lastPersistedAt: nowMs(),
-  });
+  await flushDirtyAccounts();
 }
 
 async function getValidToken(

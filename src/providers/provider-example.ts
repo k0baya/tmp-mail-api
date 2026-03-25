@@ -103,7 +103,7 @@ const CONFIG = {
   /** Optional in-memory hot cache TTL (ms). */
   PROVIDER_MEMORY_CACHE_TTL_MS: 5 * 60 * 1000,
   /** Optional minimum interval between KV writes for the same record (ms). */
-  PROVIDER_KV_WRITE_MIN_INTERVAL_MS: 30 * 1000,
+  PROVIDER_KV_WRITE_MIN_INTERVAL_MS: 180 * 1000,
 } as const;
 
 // ─── Env helpers ─────────────────────────────────────────────────────
@@ -138,9 +138,9 @@ const PROVIDER_MEMORY_CACHE_TTL_MS = envPositiveInt(
   "PROVIDER_MEMORY_CACHE_TTL_MS",
   300_000,
 );
-const PROVIDER_KV_WRITE_MIN_INTERVAL_MS = envPositiveInt(
-  "PROVIDER_KV_WRITE_MIN_INTERVAL_MS",
-  30_000,
+const PROVIDER_KV_WRITE_MIN_INTERVAL_MS = Math.min(
+  envPositiveInt("PROVIDER_KV_WRITE_MIN_INTERVAL_MS", 180_000),
+  180_000,
 );
 
 // ─── Deno KV ─────────────────────────────────────────────────────────
@@ -157,8 +157,15 @@ const keyBuilders = {
 };
 const accountCache = new Map<
   string,
-  { account: AccountRecord; expiresAt: number; lastPersistedAt: number }
+  {
+    account: AccountRecord;
+    expiresAt: number;
+    lastPersistedAt: number;
+    dirty: boolean;
+  }
 >();
+let accountFlushTimer: ReturnType<typeof setTimeout> | null = null;
+let accountFlushPromise: Promise<void> | null = null;
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -233,9 +240,74 @@ async function loadAccount(email: string): Promise<AccountRecord | null> {
       account: entry.value,
       expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
       lastPersistedAt: nowMs(),
+      dirty: false,
     });
   }
   return entry.value ?? null;
+}
+
+function queueAccountFlush(force = false): void {
+  if (accountFlushTimer && !force) return;
+  if (accountFlushTimer) clearTimeout(accountFlushTimer);
+  accountFlushTimer = setTimeout(() => {
+    accountFlushTimer = null;
+    void flushDirtyAccounts();
+  }, force ? 0 : PROVIDER_KV_WRITE_MIN_INTERVAL_MS);
+}
+
+async function persistAccount(account: AccountRecord): Promise<void> {
+  await kv.set(keyBuilders.account(account.address), account, {
+    expireIn: ACCOUNT_TTL_MS,
+  });
+  accountCache.set(account.address, {
+    account,
+    expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
+    lastPersistedAt: nowMs(),
+    dirty: false,
+  });
+}
+
+async function flushDirtyAccounts(): Promise<void> {
+  if (accountFlushPromise) return;
+  const dirtyEntries = Array.from(accountCache.values()).filter((entry) =>
+    entry.dirty
+  );
+  if (dirtyEntries.length === 0) return;
+  accountFlushPromise = (async () => {
+    let flushed = 0;
+    for (const entry of dirtyEntries) {
+      const current = accountCache.get(entry.account.address);
+      if (!current?.dirty) continue;
+      try {
+        await persistAccount(current.account);
+        flushed += 1;
+      } catch (error) {
+        console.error(JSON.stringify({
+          level: "error",
+          type: "provider_flush_failed",
+          provider: "example",
+          email: current.account.address,
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      }
+    }
+    if (flushed > 0) {
+      console.log(JSON.stringify({
+        level: "info",
+        type: "provider_flush_ok",
+        provider: "example",
+        flushed,
+      }));
+    }
+  })();
+  try {
+    await accountFlushPromise;
+  } finally {
+    accountFlushPromise = null;
+    if (Array.from(accountCache.values()).some((entry) => entry.dirty)) {
+      queueAccountFlush();
+    }
+  }
 }
 
 async function saveAccount(account: AccountRecord, force = false): Promise<void> {
@@ -244,25 +316,21 @@ async function saveAccount(account: AccountRecord, force = false): Promise<void>
     account,
     expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
     lastPersistedAt: cached?.lastPersistedAt ?? 0,
+    dirty: true,
   });
-  if (
-    !force &&
-    cached &&
-    nowMs() - cached.lastPersistedAt < PROVIDER_KV_WRITE_MIN_INTERVAL_MS
-  ) {
+  if (force || !cached) {
+    await persistAccount(account);
     return;
   }
-  await kv.set(keyBuilders.account(account.address), account, {
-    expireIn: ACCOUNT_TTL_MS,
-  });
-  accountCache.set(account.address, {
-    account,
-    expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
-    lastPersistedAt: nowMs(),
-  });
+  if (nowMs() - cached.lastPersistedAt < PROVIDER_KV_WRITE_MIN_INTERVAL_MS) {
+    queueAccountFlush();
+    return;
+  }
+  await flushDirtyAccounts();
 }
 
 async function deleteAccount(email: string): Promise<void> {
+  accountCache.delete(email);
   await kv.delete(keyBuilders.account(email));
 }
 

@@ -112,6 +112,21 @@ type UsageCounterSnapshot = {
   daily: number;
 };
 
+type UsageDayLedger = {
+  persisted: number;
+  pending: number;
+  loaded: boolean;
+};
+
+type UsageLedgerEntry = {
+  keyId: string;
+  totalPersisted: number;
+  totalPending: number;
+  totalLoaded: boolean;
+  daily: Map<string, UsageDayLedger>;
+  dirty: boolean;
+};
+
 type AuthCacheEntry = {
   expiresAt: number;
   keyId: string | null;
@@ -190,8 +205,12 @@ const MAIL_ID_MEMORY_TTL_MS = envPositiveIntSync(
   "MAIL_ID_MEMORY_TTL_MS",
   900_000,
 );
+const USAGE_LEDGER_FLUSH_INTERVAL_MS = Math.min(
+  envPositiveIntSync("USAGE_LEDGER_FLUSH_INTERVAL_MS", 180_000),
+  180_000,
+);
 const METRIC_FLUSH_INTERVAL_MS = Math.min(
-  envPositiveIntSync("METRIC_FLUSH_INTERVAL_MS", 5_000),
+  envPositiveIntSync("METRIC_FLUSH_INTERVAL_MS", 180_000),
   180_000,
 );
 const METRIC_FLUSH_MAX_PENDING = envPositiveIntSync(
@@ -211,8 +230,11 @@ let pendingMetricSums = new Map<
   string,
   { key: readonly (string | number | bigint)[]; amount: bigint }
 >();
+let usageLedger = new Map<string, UsageLedgerEntry>();
 let metricFlushTimer: ReturnType<typeof setTimeout> | null = null;
 let metricFlushPromise: Promise<void> | null = null;
+let usageLedgerFlushTimer: ReturnType<typeof setTimeout> | null = null;
+let usageLedgerFlushPromise: Promise<void> | null = null;
 
 if (!ADMIN_PASSWORD) {
   throw new Error("Missing required configuration: ADMIN_PASSWORD");
@@ -306,7 +328,17 @@ function bufferMetricSum(
     key,
     amount: (existing?.amount ?? 0n) + amount,
   });
-  queueMetricFlush(pendingMetricSums.size >= METRIC_FLUSH_MAX_PENDING);
+  if (pendingMetricSums.size >= METRIC_FLUSH_MAX_PENDING) {
+    queueMetricFlush(true);
+    return;
+  }
+  queueMetricFlush();
+}
+
+function readBufferedSum(
+  key: readonly (string | number | bigint)[],
+): number {
+  return Number(pendingMetricSums.get(JSON.stringify(key))?.amount ?? 0n);
 }
 
 async function flushPendingMetricSums(): Promise<void> {
@@ -330,6 +362,7 @@ async function flushPendingMetricSums(): Promise<void> {
       }));
       return;
     }
+    invalidateProxyStatsCache();
     console.log(JSON.stringify({
       level: "info",
       type: "metric_flush_ok",
@@ -340,6 +373,183 @@ async function flushPendingMetricSums(): Promise<void> {
     await metricFlushPromise;
   } finally {
     metricFlushPromise = null;
+  }
+}
+
+function queueUsageLedgerFlush(force = false): void {
+  if (usageLedgerFlushTimer && !force) return;
+  if (usageLedgerFlushTimer) clearTimeout(usageLedgerFlushTimer);
+  usageLedgerFlushTimer = setTimeout(() => {
+    usageLedgerFlushTimer = null;
+    void flushUsageLedger();
+  }, force ? 0 : USAGE_LEDGER_FLUSH_INTERVAL_MS);
+}
+
+function getOrCreateUsageLedgerEntry(keyId: string): UsageLedgerEntry {
+  let entry = usageLedger.get(keyId);
+  if (!entry) {
+    entry = {
+      keyId,
+      totalPersisted: 0,
+      totalPending: 0,
+      totalLoaded: false,
+      daily: new Map<string, UsageDayLedger>(),
+      dirty: false,
+    };
+    usageLedger.set(keyId, entry);
+  }
+  return entry;
+}
+
+async function ensureUsageLedgerEntry(
+  auth: ApiAuthContext,
+): Promise<UsageLedgerEntry> {
+  const entry = getOrCreateUsageLedgerEntry(auth.keyId);
+  const day = utcDayStamp();
+  let dayEntry = entry.daily.get(day);
+
+  if (auth.keyRecord.quotaTotal !== null && !entry.totalLoaded) {
+    const totalEntry = await kv.get<bigint | number>(keyBuilders.apiUsageTotal(auth.keyId));
+    entry.totalPersisted = totalEntry.value ? Number(totalEntry.value) : 0;
+    entry.totalLoaded = true;
+  }
+
+  if (!dayEntry) {
+    dayEntry = {
+      persisted: 0,
+      pending: 0,
+      loaded: false,
+    };
+    entry.daily.set(day, dayEntry);
+  }
+
+  if (auth.keyRecord.quotaDaily !== null && !dayEntry.loaded) {
+    const dailyEntry = await kv.get<bigint | number>(
+      keyBuilders.apiUsageDaily(auth.keyId, day),
+    );
+    dayEntry.persisted = dailyEntry.value ? Number(dailyEntry.value) : 0;
+    dayEntry.loaded = true;
+  }
+
+  return entry;
+}
+
+function recordUsageDelta(keyId: string, count: number): void {
+  if (count <= 0) return;
+  const entry = getOrCreateUsageLedgerEntry(keyId);
+  const day = utcDayStamp();
+  let dayEntry = entry.daily.get(day);
+  if (!dayEntry) {
+    dayEntry = { persisted: 0, pending: 0, loaded: false };
+    entry.daily.set(day, dayEntry);
+  }
+  entry.totalPending += count;
+  dayEntry.pending += count;
+  entry.dirty = true;
+  queueUsageLedgerFlush();
+}
+
+function usageDayValue(dayEntry?: UsageDayLedger): number {
+  return (dayEntry?.persisted ?? 0) + (dayEntry?.pending ?? 0);
+}
+
+function readUsageSnapshotFromLedger(
+  entry: UsageLedgerEntry,
+  day = utcDayStamp(),
+): UsageCounterSnapshot {
+  return {
+    total: entry.totalPersisted + entry.totalPending,
+    daily: usageDayValue(entry.daily.get(day)),
+  };
+}
+
+async function flushUsageLedger(): Promise<void> {
+  if (usageLedgerFlushPromise) return;
+  const dirtyEntries = Array.from(usageLedger.values()).filter((entry) =>
+    entry.dirty && (
+      entry.totalPending !== 0 ||
+      Array.from(entry.daily.values()).some((dayEntry) => dayEntry.pending !== 0)
+    )
+  );
+  if (dirtyEntries.length === 0) return;
+  usageLedgerFlushPromise = (async () => {
+    const currentDay = utcDayStamp();
+    let flushedEntries = 0;
+    let shouldRetry = false;
+    for (const entry of dirtyEntries) {
+      const totalPending = entry.totalPending;
+      const dayPendings = Array.from(entry.daily.entries())
+        .map(([day, dayEntry]) => ({ day, pending: dayEntry.pending }))
+        .filter((item) => item.pending !== 0);
+      if (totalPending === 0 && dayPendings.length === 0) {
+        entry.dirty = false;
+        continue;
+      }
+      let operation = kv.atomic();
+      if (totalPending !== 0) {
+        operation = operation.sum(
+          keyBuilders.apiUsageTotal(entry.keyId),
+          BigInt(totalPending),
+        );
+      }
+      for (const item of dayPendings) {
+        operation = operation.sum(
+          keyBuilders.apiUsageDaily(entry.keyId, item.day),
+          BigInt(item.pending),
+        );
+      }
+      const result = await operation.commit();
+      if (!result.ok) {
+        shouldRetry = true;
+        console.error(JSON.stringify({
+          level: "error",
+          type: "usage_ledger_flush_failed",
+          keyId: entry.keyId,
+        }));
+        continue;
+      }
+      if (totalPending !== 0) {
+        entry.totalPersisted += totalPending;
+        entry.totalPending -= totalPending;
+        entry.totalLoaded = true;
+      }
+      for (const item of dayPendings) {
+        const dayEntry = entry.daily.get(item.day);
+        if (!dayEntry) continue;
+        dayEntry.persisted += item.pending;
+        dayEntry.pending -= item.pending;
+        dayEntry.loaded = true;
+        if (item.day !== currentDay && dayEntry.pending === 0) {
+          entry.daily.delete(item.day);
+        }
+      }
+      entry.dirty = entry.totalPending !== 0 ||
+        Array.from(entry.daily.values()).some((dayEntry) => dayEntry.pending !== 0);
+      flushedEntries += 1;
+    }
+    if (flushedEntries > 0) {
+      console.log(JSON.stringify({
+        level: "info",
+        type: "usage_ledger_flush_ok",
+        flushedEntries,
+      }));
+    }
+    if (
+      shouldRetry ||
+      Array.from(usageLedger.values()).some((entry) =>
+        entry.dirty && (
+          entry.totalPending !== 0 ||
+          Array.from(entry.daily.values()).some((dayEntry) => dayEntry.pending !== 0)
+        )
+      )
+    ) {
+      queueUsageLedgerFlush();
+    }
+  })();
+  try {
+    await usageLedgerFlushPromise;
+  } finally {
+    usageLedgerFlushPromise = null;
   }
 }
 
@@ -1155,26 +1365,12 @@ async function authenticateApiRequest(
   return { keyId: keyRecord.id, keyRecord };
 }
 
-async function readUsageCounters(
-  keyId: string,
-): Promise<UsageCounterSnapshot> {
-  const [totalEntry, dailyEntry] = await kv.getMany(
-    [
-      keyBuilders.apiUsageTotal(keyId),
-      keyBuilders.apiUsageDaily(keyId, utcDayStamp()),
-    ] as const,
-  );
-  return {
-    total: totalEntry.value ? Number(totalEntry.value) : 0,
-    daily: dailyEntry.value ? Number(dailyEntry.value) : 0,
-  };
-}
-
 async function readUsageSnapshot(auth: ApiAuthContext): Promise<UsageCounterSnapshot> {
   if (!keyHasQuota(auth.keyRecord)) {
     return { total: 0, daily: 0 };
   }
-  return await readUsageCounters(auth.keyId);
+  const entry = await ensureUsageLedgerEntry(auth);
+  return readUsageSnapshotFromLedger(entry);
 }
 
 function assertQuotaAvailable(
@@ -1214,21 +1410,7 @@ async function incrementUsageCountersBy(keyId: string, count: number): Promise<v
   if (count <= 0) return;
   const day = utcDayStamp();
   const n = BigInt(count);
-  const result = await kv.atomic()
-    .sum(keyBuilders.apiUsageTotal(keyId), n)
-    .sum(keyBuilders.apiUsageDaily(keyId, day), n)
-    .commit();
-  if (!result.ok) {
-    console.error(
-      JSON.stringify({
-        level: "error",
-        msg: "usage_increment_failed",
-        keyId,
-        count,
-      }),
-    );
-    return;
-  }
+  recordUsageDelta(keyId, count);
   bufferMetricSum(keyBuilders.metric("upstream_total"), n);
   bufferMetricSum(keyBuilders.metricDay("upstream_total", day), n);
 }
@@ -1237,20 +1419,7 @@ async function incrementFailureGuardrail(keyId: string, count: number): Promise<
   if (count <= 0) return;
   const day = utcDayStamp();
   const n = BigInt(count);
-  const result = await kv.atomic()
-    .sum(keyBuilders.failureGuardrailDaily(keyId, day), n)
-    .commit();
-  if (!result.ok) {
-    console.error(
-      JSON.stringify({
-        level: "error",
-        msg: "failure_guardrail_increment_failed",
-        keyId,
-        count,
-      }),
-    );
-    return;
-  }
+  bufferMetricSum(keyBuilders.failureGuardrailDaily(keyId, day), n);
   bufferMetricSum(keyBuilders.metric("upstream_failed_total"), n);
   bufferMetricSum(keyBuilders.metricDay("upstream_failed_total", day), n);
 }
@@ -1326,6 +1495,7 @@ async function deleteApiKeyRecord(keyId: string): Promise<void> {
   if (!result.ok) {
     throw new HttpError(500, "Failed to delete API key.");
   }
+  usageLedger.delete(keyId);
   invalidateApiKeyAuthCache(existing.value.keyHash);
   invalidateProxyStatsCache();
 }
@@ -1349,10 +1519,13 @@ async function listApiKeysWithUsage(): Promise<
         keyBuilders.apiUsageDaily(record.id, day),
       ] as const,
     );
+    const ledgerEntry = usageLedger.get(record.id);
     items.push({
       ...record,
-      usageTotal: usageTotalEntry.value ? Number(usageTotalEntry.value) : 0,
-      usageDaily: usageDailyEntry.value ? Number(usageDailyEntry.value) : 0,
+      usageTotal: (usageTotalEntry.value ? Number(usageTotalEntry.value) : 0) +
+        (ledgerEntry?.totalPending ?? 0),
+      usageDaily: (usageDailyEntry.value ? Number(usageDailyEntry.value) : 0) +
+        (ledgerEntry?.daily.get(day)?.pending ?? 0),
     });
   }
   return items;
@@ -1371,25 +1544,30 @@ async function getProxyStats(): Promise<{
   todayUpstreamCalls: number;
   activeApiKeys: number;
 }> {
-  if (proxyStatsCache && proxyStatsCache.expiresAt > nowMs()) {
-    return proxyStatsCache.value;
+  const day = utcDayStamp();
+  if (!proxyStatsCache || proxyStatsCache.expiresAt <= nowMs()) {
+    const [totalEntry, dailyEntry] = await kv.getMany(
+      [
+        keyBuilders.metric("upstream_total"),
+        keyBuilders.metricDay("upstream_total", day),
+      ] as const,
+    );
+    proxyStatsCache = {
+      value: {
+        totalUpstreamCalls: totalEntry.value ? Number(totalEntry.value) : 0,
+        todayUpstreamCalls: dailyEntry.value ? Number(dailyEntry.value) : 0,
+        activeApiKeys: await countActiveApiKeys(),
+      },
+      expiresAt: nowMs() + STATS_CACHE_TTL_MS,
+    };
   }
-  const [totalEntry, dailyEntry] = await kv.getMany(
-    [
-      keyBuilders.metric("upstream_total"),
-      keyBuilders.metricDay("upstream_total", utcDayStamp()),
-    ] as const,
-  );
-  const value = {
-    totalUpstreamCalls: totalEntry.value ? Number(totalEntry.value) : 0,
-    todayUpstreamCalls: dailyEntry.value ? Number(dailyEntry.value) : 0,
-    activeApiKeys: await countActiveApiKeys(),
+  return {
+    totalUpstreamCalls: proxyStatsCache.value.totalUpstreamCalls +
+      readBufferedSum(keyBuilders.metric("upstream_total")),
+    todayUpstreamCalls: proxyStatsCache.value.todayUpstreamCalls +
+      readBufferedSum(keyBuilders.metricDay("upstream_total", day)),
+    activeApiKeys: proxyStatsCache.value.activeApiKeys,
   };
-  proxyStatsCache = {
-    value,
-    expiresAt: nowMs() + STATS_CACHE_TTL_MS,
-  };
-  return value;
 }
 
 function saveMailIdMapping(

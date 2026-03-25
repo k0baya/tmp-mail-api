@@ -38,7 +38,7 @@ const CONFIG = {
   LINSHI_SESSION_TTL_MS: 3_000_000,
   LINSHI_MAX_DETAIL_FETCH: 0,
   PROVIDER_MEMORY_CACHE_TTL_MS: 5 * 60 * 1000,
-  PROVIDER_KV_WRITE_MIN_INTERVAL_MS: 30 * 1000,
+  PROVIDER_KV_WRITE_MIN_INTERVAL_MS: 180 * 1000,
   LINSHI_MAIL_META_TTL_MS: 15 * 60 * 1000,
 } as const;
 
@@ -74,9 +74,9 @@ const PROVIDER_MEMORY_CACHE_TTL_MS = envPositiveInt(
   "PROVIDER_MEMORY_CACHE_TTL_MS",
   5 * 60 * 1000,
 );
-const PROVIDER_KV_WRITE_MIN_INTERVAL_MS = envPositiveInt(
-  "PROVIDER_KV_WRITE_MIN_INTERVAL_MS",
-  30 * 1000,
+const PROVIDER_KV_WRITE_MIN_INTERVAL_MS = Math.min(
+  envPositiveInt("PROVIDER_KV_WRITE_MIN_INTERVAL_MS", 180 * 1000),
+  180 * 1000,
 );
 const LINSHI_MAIL_META_TTL_MS = envPositiveInt(
   "LINSHI_MAIL_META_TTL_MS",
@@ -96,12 +96,19 @@ const keyBuilders = {
 };
 const linshiSessionCache = new Map<
   string,
-  { session: LinshiSessionRecord; expiresAt: number; lastPersistedAt: number }
+  {
+    session: LinshiSessionRecord;
+    expiresAt: number;
+    lastPersistedAt: number;
+    dirty: boolean;
+  }
 >();
 const linshiMailMetaCache = new Map<
   string,
   { meta: LinshiMailMeta; expiresAt: number }
 >();
+let linshiSessionFlushTimer: ReturnType<typeof setTimeout> | null = null;
+let linshiSessionFlushPromise: Promise<void> | null = null;
 
 function nowMs(): number {
   return Date.now();
@@ -179,9 +186,74 @@ async function loadLinshiSession(
       session: entry.value,
       expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
       lastPersistedAt: nowMs(),
+      dirty: false,
     });
   }
   return entry.value ?? null;
+}
+
+function queueLinshiSessionFlush(force = false): void {
+  if (linshiSessionFlushTimer && !force) return;
+  if (linshiSessionFlushTimer) clearTimeout(linshiSessionFlushTimer);
+  linshiSessionFlushTimer = setTimeout(() => {
+    linshiSessionFlushTimer = null;
+    void flushDirtyLinshiSessions();
+  }, force ? 0 : PROVIDER_KV_WRITE_MIN_INTERVAL_MS);
+}
+
+async function persistLinshiSession(session: LinshiSessionRecord): Promise<void> {
+  await kv.set(keyBuilders.linshiSession(session.email), session, {
+    expireIn: LINSHI_SESSION_TTL_MS,
+  });
+  linshiSessionCache.set(session.email, {
+    session,
+    expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
+    lastPersistedAt: nowMs(),
+    dirty: false,
+  });
+}
+
+async function flushDirtyLinshiSessions(): Promise<void> {
+  if (linshiSessionFlushPromise) return;
+  const dirtyEntries = Array.from(linshiSessionCache.values()).filter((entry) =>
+    entry.dirty
+  );
+  if (dirtyEntries.length === 0) return;
+  linshiSessionFlushPromise = (async () => {
+    let flushed = 0;
+    for (const entry of dirtyEntries) {
+      const current = linshiSessionCache.get(entry.session.email);
+      if (!current?.dirty) continue;
+      try {
+        await persistLinshiSession(current.session);
+        flushed += 1;
+      } catch (error) {
+        console.error(JSON.stringify({
+          level: "error",
+          type: "provider_flush_failed",
+          provider: "linshiyouxiang",
+          email: current.session.email,
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      }
+    }
+    if (flushed > 0) {
+      console.log(JSON.stringify({
+        level: "info",
+        type: "provider_flush_ok",
+        provider: "linshiyouxiang",
+        flushed,
+      }));
+    }
+  })();
+  try {
+    await linshiSessionFlushPromise;
+  } finally {
+    linshiSessionFlushPromise = null;
+    if (Array.from(linshiSessionCache.values()).some((entry) => entry.dirty)) {
+      queueLinshiSessionFlush();
+    }
+  }
 }
 
 async function saveLinshiSession(
@@ -193,28 +265,23 @@ async function saveLinshiSession(
     session,
     expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
     lastPersistedAt: cached?.lastPersistedAt ?? 0,
+    dirty: true,
   });
-  if (
-    !force &&
-    cached &&
-    nowMs() - cached.lastPersistedAt < PROVIDER_KV_WRITE_MIN_INTERVAL_MS
-  ) {
+  if (force || !cached) {
+    await persistLinshiSession(session);
+    return;
+  }
+  if (nowMs() - cached.lastPersistedAt < PROVIDER_KV_WRITE_MIN_INTERVAL_MS) {
     console.log(JSON.stringify({
       level: "info",
       type: "provider_write_throttled",
       provider: "linshiyouxiang",
       email: session.email,
     }));
+    queueLinshiSessionFlush();
     return;
   }
-  await kv.set(keyBuilders.linshiSession(session.email), session, {
-    expireIn: LINSHI_SESSION_TTL_MS,
-  });
-  linshiSessionCache.set(session.email, {
-    session,
-    expiresAt: nowMs() + PROVIDER_MEMORY_CACHE_TTL_MS,
-    lastPersistedAt: nowMs(),
-  });
+  await flushDirtyLinshiSessions();
 }
 
 function linshiMailMetaCacheKey(email: string, mailId: string): string {
