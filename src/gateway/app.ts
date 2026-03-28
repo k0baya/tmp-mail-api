@@ -139,6 +139,12 @@ type ProxyStatsSnapshot = {
   activeApiKeys: number;
 };
 
+type ApiKeyIndexSnapshot = {
+  byHash: Map<string, ApiKeyRecord>;
+  byId: Map<string, ApiKeyRecord>;
+  activeCount: number;
+};
+
 type Locale = "en" | "zh";
 type ThemeMode = "system" | "light" | "dark";
 
@@ -231,6 +237,8 @@ let pendingMetricSums = new Map<
   { key: readonly (string | number | bigint)[]; amount: bigint }
 >();
 let usageLedger = new Map<string, UsageLedgerEntry>();
+let apiKeyIndex: ApiKeyIndexSnapshot | null = null;
+let apiKeyIndexPromise: Promise<ApiKeyIndexSnapshot> | null = null;
 let metricFlushTimer: ReturnType<typeof setTimeout> | null = null;
 let metricFlushPromise: Promise<void> | null = null;
 let usageLedgerFlushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -268,36 +276,104 @@ const keyBuilders = {
 
 let configCache: Record<string, string> | null = null;
 let configCacheAt = 0;
-const CONFIG_CACHE_TTL_MS = 30_000;
+let configCachePromise: Promise<Record<string, string>> | null = null;
+const CONFIG_CACHE_TTL_MS = envNonNegativeIntSync("CONFIG_CACHE_TTL_MS", 0);
 
-async function loadKvConfig(): Promise<Record<string, string>> {
+async function loadKvConfig(forceRefresh = false): Promise<Record<string, string>> {
   const now = Date.now();
-  if (configCache && now - configCacheAt < CONFIG_CACHE_TTL_MS) {
+  if (
+    !forceRefresh &&
+    configCache &&
+    (CONFIG_CACHE_TTL_MS === 0 || now - configCacheAt < CONFIG_CACHE_TTL_MS)
+  ) {
     return configCache;
   }
-  const next: Record<string, string> = {};
-  for await (const entry of kv.list<string>({ prefix: ["config"] })) {
-    const key = typeof entry.key[1] === "string" ? entry.key[1] : "";
-    if (key && typeof entry.value === "string") {
-      next[key] = entry.value;
+  if (configCachePromise && !forceRefresh) return await configCachePromise;
+  configCachePromise = (async () => {
+    const next: Record<string, string> = {};
+    for await (const entry of kv.list<string>({ prefix: ["config"] })) {
+      const key = typeof entry.key[1] === "string" ? entry.key[1] : "";
+      if (key && typeof entry.value === "string") {
+        next[key] = entry.value;
+      }
     }
+    configCache = next;
+    configCacheAt = Date.now();
+    return next;
+  })();
+  try {
+    return await configCachePromise;
+  } finally {
+    configCachePromise = null;
   }
-  configCache = next;
-  configCacheAt = now;
-  return next;
 }
 
 function invalidateConfigCache(): void {
   configCache = null;
   configCacheAt = 0;
+  configCachePromise = null;
 }
 
 function invalidateProxyStatsCache(): void {
   proxyStatsCache = null;
 }
 
+function invalidateApiKeyIndex(): void {
+  apiKeyIndex = null;
+  apiKeyIndexPromise = null;
+}
+
 function invalidateApiKeyAuthCache(keyHash?: string): void {
   if (keyHash) authCache.delete(keyHash);
+}
+
+function recomputeApiKeyIndexActiveCount(snapshot: ApiKeyIndexSnapshot): void {
+  snapshot.activeCount = 0;
+  for (const record of snapshot.byId.values()) {
+    if (record.status === "active") snapshot.activeCount += 1;
+  }
+}
+
+function upsertApiKeyIndex(record: ApiKeyRecord): void {
+  if (!apiKeyIndex) return;
+  const previous = apiKeyIndex.byId.get(record.id);
+  if (previous) {
+    apiKeyIndex.byHash.delete(previous.keyHash);
+  }
+  apiKeyIndex.byId.set(record.id, record);
+  apiKeyIndex.byHash.set(record.keyHash, record);
+  recomputeApiKeyIndexActiveCount(apiKeyIndex);
+}
+
+function removeApiKeyFromIndex(record: ApiKeyRecord): void {
+  if (!apiKeyIndex) return;
+  apiKeyIndex.byId.delete(record.id);
+  apiKeyIndex.byHash.delete(record.keyHash);
+  recomputeApiKeyIndexActiveCount(apiKeyIndex);
+}
+
+async function loadApiKeyIndex(): Promise<ApiKeyIndexSnapshot> {
+  if (apiKeyIndex) return apiKeyIndex;
+  if (apiKeyIndexPromise) return await apiKeyIndexPromise;
+  apiKeyIndexPromise = (async () => {
+    const snapshot: ApiKeyIndexSnapshot = {
+      byHash: new Map(),
+      byId: new Map(),
+      activeCount: 0,
+    };
+    for await (const entry of kv.list<ApiKeyRecord>({ prefix: ["api_key"] })) {
+      snapshot.byId.set(entry.value.id, entry.value);
+      snapshot.byHash.set(entry.value.keyHash, entry.value);
+      if (entry.value.status === "active") snapshot.activeCount += 1;
+    }
+    apiKeyIndex = snapshot;
+    return snapshot;
+  })();
+  try {
+    return await apiKeyIndexPromise;
+  } finally {
+    apiKeyIndexPromise = null;
+  }
 }
 
 function keyHasQuota(record: ApiKeyRecord): boolean {
@@ -1327,28 +1403,13 @@ async function authenticateApiRequest(
     }
     authCache.delete(keyHash);
   }
-  const keyIdEntry = await kv.get<string>(keyBuilders.apiKeyHash(keyHash));
-  if (!keyIdEntry.value) {
-    authCache.set(keyHash, {
-      expiresAt: nowMs() + AUTH_NEGATIVE_CACHE_TTL_MS,
-      keyId: null,
-      keyRecord: null,
-    });
-    throw new HttpError(401, "Missing or invalid bearer token.");
-  }
-  const keyRecordEntry = await kv.get<ApiKeyRecord>(
-    keyBuilders.apiKey(keyIdEntry.value),
-  );
-  const keyRecord = keyRecordEntry.value;
+  const keyRecord = (await loadApiKeyIndex()).byHash.get(keyHash) ?? null;
   if (!keyRecord) {
     authCache.set(keyHash, {
       expiresAt: nowMs() + AUTH_NEGATIVE_CACHE_TTL_MS,
       keyId: null,
       keyRecord: null,
     });
-    throw new HttpError(401, "Missing or invalid bearer token.");
-  }
-  if (!timingSafeEqual(keyRecord.keyHash, keyHash)) {
     throw new HttpError(401, "Missing or invalid bearer token.");
   }
   authCache.set(keyHash, {
@@ -1454,6 +1515,7 @@ async function createApiKeyRecord(params: {
   if (!result.ok) {
     throw new HttpError(500, "Failed to create API key.");
   }
+  upsertApiKeyIndex(record);
   invalidateProxyStatsCache();
   return { record, rawKey };
 }
@@ -1473,6 +1535,7 @@ async function updateApiKeyRecord(keyId: string, updates: {
     updatedAt: nowMs(),
   };
   await kv.set(keyBuilders.apiKey(keyId), record);
+  upsertApiKeyIndex(record);
   invalidateApiKeyAuthCache(existing.value.keyHash);
   invalidateProxyStatsCache();
 }
@@ -1496,6 +1559,7 @@ async function deleteApiKeyRecord(keyId: string): Promise<void> {
     throw new HttpError(500, "Failed to delete API key.");
   }
   usageLedger.delete(keyId);
+  removeApiKeyFromIndex(existing.value);
   invalidateApiKeyAuthCache(existing.value.keyHash);
   invalidateProxyStatsCache();
 }
@@ -1507,10 +1571,7 @@ async function listApiKeysWithUsage(): Promise<
     ApiKeyRecord & { usageTotal: number; usageDaily: number }
   > = [];
   const day = utcDayStamp();
-  const records: ApiKeyRecord[] = [];
-  for await (const entry of kv.list<ApiKeyRecord>({ prefix: ["api_key"] })) {
-    records.push(entry.value);
-  }
+  const records = Array.from((await loadApiKeyIndex()).byId.values());
   records.sort((left, right) => right.createdAt - left.createdAt);
   for (const record of records) {
     const [usageTotalEntry, usageDailyEntry] = await kv.getMany(
@@ -1532,11 +1593,7 @@ async function listApiKeysWithUsage(): Promise<
 }
 
 async function countActiveApiKeys(): Promise<number> {
-  let count = 0;
-  for await (const entry of kv.list<ApiKeyRecord>({ prefix: ["api_key"] })) {
-    if (entry.value.status === "active") count += 1;
-  }
-  return count;
+  return (await loadApiKeyIndex()).activeCount;
 }
 
 async function getProxyStats(): Promise<{
@@ -2476,6 +2533,10 @@ async function routeAdmin(ctx: RequestContext): Promise<Response> {
     });
   }
   const session = sessionState.session;
+
+  if (ctx.url.pathname.startsWith("/admin/settings")) {
+    await loadKvConfig(true);
+  }
 
   if (ctx.request.method === "GET" && ctx.url.pathname === "/admin") {
     const result = await renderFrontendPage(
